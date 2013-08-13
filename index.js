@@ -1,26 +1,36 @@
-var fileTree = require('file-size-tree')
-var detective = require('detective')
-var quotemeta = require('quotemeta')
-var commondir = require('commondir')
+var globals = require('insert-module-globals')
+var builtins = require('browser-builtins')
 var mdeps = require('module-deps')
 var sdeps = require('deps-sort')
+var resolve = require('resolve')
+
+var fileTree = require('file-size-tree')
+var quotemeta = require('quotemeta')
+var commondir = require('commondir')
 var once = require('once')
 var path = require('path')
 var fs = require('fs')
+
+var preludeSize = fs.statSync(require.resolve('browser-pack/_prelude')).size
+var bufferPath = require.resolve('insert-module-globals/buffer')
+var processPath = submodule(
+    'insert-module-globals'
+  , 'process/browser'
+)
 
 module.exports = {
     json: json
   , bundle: bundle
 }
 
-var ignore = Object.keys(require('browser-builtins')).concat([
-  'os', 'module'
-])
+var ignore = Object.keys(builtins).concat(['os', 'module', 'cluster'])
 ignore = '^(?:' + ignore.join('|') + ')$'
 ignore = new RegExp(ignore, 'i')
 
 function json(files, transforms, callback) {
   var found = []
+    , foundbuiltins = []
+    , virtual = []
 
   files = toarray(files)
   transforms = toarray(transforms)
@@ -29,9 +39,13 @@ function json(files, transforms, callback) {
   mdeps(files, {
       transform: transforms
     , filter: function(module) {
+      if (builtins[module]) {
+        insert(foundbuiltins, builtins[module])
+      }
       return !ignore.test(module)
     }
-  }).pipe(sdeps())
+  }).pipe(globals(files))
+    .pipe(sdeps())
     .once('error', callback)
     .once('close', function() {
       var root = path.basename(commondir(found))
@@ -40,10 +54,43 @@ function json(files, transforms, callback) {
         , children: fileTree(found)
       }
 
+      virtual.push({
+          name: 'prelude.js'
+        , size: preludeSize
+      })
+
+      foundbuiltins = foundbuiltins.map(function(builtin) {
+        return {
+            name: path.basename(builtin)
+          , size: fs.statSync(builtin).size
+        }
+      })
+
+      ;[].push.apply(virtual, foundbuiltins)
+      if (virtual.length) {
+        tree.children.push({
+            name: 'builtins'
+          , children: virtual
+        })
+      }
+
       dirsizes(tree)
       callback(null, tree)
     })
     .on('data', function(dep) {
+      if (dep.id === processPath) {
+        return virtual.push({
+            name: 'process.js'
+          , size: dep.source.length
+        })
+      } else
+      if (dep.id === bufferPath) {
+        return virtual.push({
+            name: 'buffer.js'
+          , size: dep.source.length
+        })
+      }
+
       found.push(dep.id)
     })
 }
@@ -104,4 +151,16 @@ function dirsizes(child) {
   return child.size = "size" in child ? child.size : child.children.reduce(function(size, child) {
     return size + ("size" in child ? child.size : dirsizes(child))
   }, 0)
+}
+
+function insert(array, value) {
+  if (array.indexOf(value) === -1) array.push(value)
+  return array
+}
+
+function submodule(parent, child) {
+  parent = require.resolve(parent)
+  return resolve.sync(child, {
+    basedir: path.dirname(parent)
+  })
 }
